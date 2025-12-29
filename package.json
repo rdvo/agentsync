@@ -1,0 +1,41 @@
+{
+  "name": "agentsync",
+  "version": "0.2.0-beta",
+  "description": "One Source of Truth for your AI Skills (Claude, Cursor, Windsurf, OpenCode, Codex)",
+  "bin": {
+    "agentsync": "./agentsync"
+  },
+  "scripts": {
+    "test": "bats tests/",
+    "test:ci": "bats --formatter junit tests/",
+    "lint": "shellcheck agentsync lib/*.sh",
+    "lint:fix": "shellcheck -x agentsync lib/*.sh"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "claude",
+    "cursor",
+    "windsurf",
+    "opencode",
+    "codex",
+    "skills",
+    "sync"
+  ],
+  "author": "Rob",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentsync/agentsync.git"
+  },
+  "files": [
+    "agentsync",
+    "lib/",
+    "README.md",
+    "LICENSE",
+    "install.sh"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
