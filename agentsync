@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# agentsync - One Source of Truth for your AI Skills.
+# https://github.com/yourusername/agentsync
+
+set -eo pipefail
+
+# --- 1. Boilerplate & Environment ---
+AGENTSYNC_VERSION="0.2.0-beta"
+
+# Robustly resolve the real location of this script, handling symlinks
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+_SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+_LIB_DIR="$_SCRIPT_DIR/lib"
+
+# --- 2. Source Modules ---
+source "$_LIB_DIR/utils.sh"
+source "$_LIB_DIR/detect.sh"
+source "$_LIB_DIR/config.sh"
+source "$_LIB_DIR/link.sh"
+source "$_LIB_DIR/sync.sh"
+source "$_LIB_DIR/watch.sh"
+source "$_LIB_DIR/init.sh"
+source "$_LIB_DIR/add.sh"
+source "$_LIB_DIR/import.sh"
+source "$_LIB_DIR/list.sh"
+source "$_LIB_DIR/wipe.sh"
+
+# --- 3. Command Definitions ---
+
+cmd_help() {
+    echo -e "${BOLD}${CYAN}agentsync v$AGENTSYNC_VERSION${NC}"
+    echo "One Source of Truth for your AI Skills."
+    echo ""
+    echo -e "${BOLD}Usage:${NC}"
+    echo "  agentsync <command> [options]"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo "  init          Initialize agentsync in the current project or globally"
+    echo "  sync          Sync skills from source of truth to all AI tool folders"
+    echo "  repair        Repair broken symlinks"
+    echo "  import        Adopt existing agents from other tools into .shared"
+    echo "  status        Show current sync status and detected tools"
+    echo "  check         Validate configuration and check tool availability"
+    echo "  watch         Start the auto-sync daemon"
+    echo "  list          List installed agents, skills, and commands"
+    echo "  wipe          Wipe AI tool sync folders (with warning)"
+    echo "  add <uri>     Install from GitHub (e.g., user/repo [--type agent|skill|command])"
+    echo "  config        Show or update current configuration"
+    echo "  version       Show version information"
+    echo "  help          Show this help message"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -v, --verbose Show debug information"
+    echo "  -q, --quiet   Suppress output"
+    echo "  --dry-run     Show what would be done without making changes"
+    echo "  --fix         Repair broken symlinks"
+    echo ""
+}
+
+cmd_check() {
+    log_header "agentsync Configuration Check"
+
+    echo ""
+    log_header "1. Installation"
+    echo "  Version: $AGENTSYNC_VERSION"
+    echo "  Script: $_SCRIPT_DIR/agentsync"
+    echo "  Lib: $_LIB_DIR"
+
+    echo ""
+    log_header "2. Configuration"
+    local config_path="${CONFIG_FILE:-~/.agentsyncrc}"
+    if [[ -f "$config_path" ]]; then
+        log_success "Config file found: $config_path"
+        config_display
+    else
+        log_warning "No config file found (using defaults)"
+    fi
+
+    echo ""
+    log_header "3. Installed AI Tools"
+    check_all_tools
+
+    echo ""
+    log_header "4. Source Directory"
+    local source_dir="${DEFAULT_SOURCE:-.shared}"
+    if [[ -d "$source_dir" ]]; then
+        log_success "Source directory exists: $source_dir"
+        local item_count=$(count_items "$source_dir")
+        echo "  Items: $item_count"
+    else
+        log_warning "Source directory not found: $source_dir"
+        echo "  Run 'agentsync init' to set up"
+    fi
+
+    echo ""
+    log_header "5. Symlink Validation"
+    local targets=""
+    if config_exists; then
+        targets=$(config_get_targets_array "$CONFIG_FILE")
+    fi
+    if [[ -z "$targets" ]]; then
+        targets=$(get_default_targets)
+    fi
+
+    local broken_total=0
+    for target in $targets; do
+        local path=$(echo "$target" | cut -d':' -f2)
+        local enabled=$(echo "$target" | cut -d':' -f3)
+        if [[ "$enabled" == "true" ]] && [[ -d "$path" ]]; then
+            local broken=$(find "$path" -mindepth 1 -maxdepth 1 -type l ! -exec test -e {} \; -print 2>/dev/null | wc -l)
+            if [[ "$broken" -gt 0 ]]; then
+                echo "  ✗ $path: $broken broken symlinks"
+                broken_total=$((broken_total + broken))
+            else
+                echo "  ✓ $path"
+            fi
+        fi
+    done
+
+    if [[ "$broken_total" -gt 0 ]]; then
+        echo ""
+        log_warning "Found $broken_total broken symlinks. Run 'agentsync repair' to fix."
+    else
+        echo ""
+        log_success "All symlinks valid"
+    fi
+}
+
+cmd_repair() {
+    log_header "Repairing broken symlinks"
+
+    local source_dir="${1:-$DEFAULT_SOURCE}"
+    local repaired=0
+    local failed=0
+
+    if [[ -z "$source_dir" ]]; then
+        source_dir=".shared"
+    fi
+
+    if [[ ! -d "$source_dir" ]]; then
+        log_error "Source directory not found: $source_dir"
+        return 1
+    fi
+
+    local targets=""
+    if config_exists; then
+        targets=$(config_get_targets_array "$CONFIG_FILE")
+    fi
+    if [[ -z "$targets" ]]; then
+        targets=$(get_default_targets)
+    fi
+
+    for target in $targets; do
+        local path=$(echo "$target" | cut -d':' -f2)
+        local enabled=$(echo "$target" | cut -d':' -f3)
+        if [[ "$enabled" == "true" ]] && [[ -d "$path" ]]; then
+            local broken=$(find "$path" -mindepth 1 -maxdepth 1 -type l ! -exec test -e {} \; -print 2>/dev/null)
+
+            if [[ -n "$broken" ]]; then
+                log_info "Checking: $path"
+
+                while IFS= read -r link; do
+                    local skill_name=$(basename "$link")
+                    local source_path="$source_dir/$skill_name"
+
+                    if [[ -e "$source_path" ]] || [[ -L "$source_path" ]]; then
+                        if [[ "$DRY_RUN" == "true" ]]; then
+                            log_info "[DRY RUN] Would repair: $link -> $source_path"
+                        else
+                            rm "$link"
+                            if link_create "$source_path" "$link" "true"; then
+                                log_success "Repaired: $skill_name"
+                                ((repaired++))
+                            else
+                                log_error "Failed to repair: $skill_name"
+                                ((failed++))
+                            fi
+                        fi
+                    else
+                        log_warning "Source missing for: $skill_name (removing broken link)"
+                        if [[ "$DRY_RUN" != "true" ]]; then
+                            rm "$link"
+                        fi
+                    fi
+                done <<< "$broken"
+            fi
+        fi
+    done
+
+    echo ""
+    if [[ "$failed" -gt 0 ]]; then
+        log_error "Repair complete: $repaired repaired, $failed failed"
+        return 1
+    else
+        log_success "Repair complete: $repaired symlinks repaired"
+    fi
+}
+
+cmd_version() {
+    echo "agentsync v$AGENTSYNC_VERSION"
+}
+
+# --- 4. Main Entry Point ---
+
+main() {
+    CMD=""
+    ARGS=()
+    VERBOSE=false
+    QUIET=false
+    DRY_RUN=false
+
+    parse_args "$@"
+
+    case "$CMD" in
+        init)
+            cmd_init "${ARGS[@]}"
+            ;;
+        sync)
+            sync_all
+            ;;
+        "")
+            # Smart default: Sync if configured, Init if not
+            if config_exists; then
+                sync_all
+            else
+                log_info "Welcome to agentsync! Starting setup..."
+                cmd_init
+            fi
+            ;;
+        repair)
+            cmd_repair "${ARGS[0]}"
+            ;;
+        import)
+            cmd_import
+            ;;
+        status)
+            check_all_tools
+            ;;
+        check)
+            cmd_check
+            ;;
+        watch)
+            local subcmd="${ARGS[0]}"
+            case "$subcmd" in
+                start|"-d"|"--daemon") watch_start ;;
+                stop) watch_stop ;;
+                status) watch_status ;;
+                *) watch_toggle ;;
+            esac
+            ;;
+        list)
+            cmd_list "${ARGS[@]}"
+            ;;
+        wipe)
+            cmd_wipe "${ARGS[@]}"
+            ;;
+        add)
+            cmd_add "${ARGS[@]}"
+            ;;
+        config)
+            config_display
+            ;;
+        version|--version)
+            cmd_version
+            ;;
+        help|--help|*)
+            cmd_help
+            ;;
+    esac
+}
+
+main "$@"
